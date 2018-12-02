@@ -1,188 +1,211 @@
 #
-# linter.py
-# Linter for SublimeLinter3, a code checking framework for Sublime Text 3
+# SublimeLinter-contrib-rustc/linter.py
+# Linter plugin for SublimeLinter,
+# a code checking framework for Sublime Text 3.
 #
-# Written by Gregory Oschwald
-# Copyright (c) 2014 Gregory Oschwald
+# Copyright (c) 2018 FichteFoll
 #
 # License: MIT
 #
-"""This module exports the Rustc plugin class."""
+"""Exports the Rustc SublimeLinter plugin class."""
 
+import getpass
+import json
+import logging
 import os
-from SublimeLinter.lint import Linter, util, persist
+import shutil
+import tempfile
+
+from SublimeLinter.lint import util
+from SublimeLinter.lint import Linter
+from SublimeLinter.lint.linter import LintMatch
+
+
+USER = getpass.getuser()
+TMPDIR_PREFIX = "SublimeLinter-contrib-rustc-%s" % USER
+
+logger = logging.getLogger("SublimeLinter.plugin.mypy")
+
+# Mapping for our created temporary directories (for rustc output)
+if 'tmpdirs' not in globals():
+    tmpdirs = {}
 
 
 class Rust(Linter):
-    """Provides an interface to Rust."""
+    """Provides an interface to Rust (rustc and cargo)."""
 
+    use_cargo = True
+    cargo_command = "check"
     defaults = {
-        'use-cargo': False,
-        'use-cargo-check': False,
-        'use-crate-root': False,
-        'crate-root': None,
+        'selector': "source.rust",
+        # Examples: 'check', 'check all', 'test all', 'clippy', 'build'
+        'cargo_command': cargo_command,
+        # Whether to use rustc for live linting of unsaved files.
+        'rustc_live': False,
+        # Whether to fall back to rustc if file isn't in a cargo project.
+        'rustc_fallback': True,
     }
-    cmd = ['rustc']
-    syntax = ('rust', 'rustenhanced')
-    tempfile_suffix = 'rs'
+    # tempfile_suffix = 'rs'
+    tempfile_suffix = '-'
+    line_col_base = (1, 0)
+    error_stream = util.STREAM_STDERR
 
-    regex = r'''(?xi)
-            ^(?:(?P<error>(error|fatal error))|(?P<warning>warning)).*?:\s+(?P<message>.+)\s*\r?
-            -->\s+(?P<file>.+?):(?P<line>\d+):(?P<col>\d+)$
-            '''
+    def should_lint(self, reason=None):
+        """Only allow background mode when rustc_live is is enabled."""
+        # TOCHECK is this sensitive to races?
+        v_settings = self.get_view_settings()
+        rustc_live = v_settings.get('rustc_live')
+        self.tempfile_suffix = "rs" if rustc_live and not self.cargo else "-"
 
-    multiline = True
-    use_cargo = False
-    use_cargo_check = False
-    use_crate_root = False
-    cargo_config = None
-    crate_root = None
+        return super().should_lint(reason=reason)
 
-    def run(self, cmd, code):
-        """
-        Return a list with the command to execute.
+    def cmd(self):
+        """Build command used to lint.
 
         The command chosen is resolved as follows:
 
-        If the `use-cargo` option is set, lint using a `cargo build`.
-        If cargo is not used, and the `use-crate-root` option is set, lint
-        the crate root. Finally, if the crate root cannot be determined, or the
-        `use-crate-root` option is not set, lint the current file.
-
-        Linting the crate (either through cargo or rustc) means that if
-        errors are caught in other files, errors on the current file might
-        not show up until these other errors are resolved.
-
-        Linting a single file means that any imports from higher in the
-        module hierarchy will probably cause an error and prevent proper
-        linting in the rest of the file.
+        - Check if the current project has a `Cargo.toml` file
+          and lint using `cargo <cargo_command>`.
+        - Otherwise lint the current file with `rustc`.
         """
-        self.use_cargo = self.get_view_settings().get('use-cargo', False)
-        self.use_cargo_check = self.get_view_settings().get('use-cargo-check',
-                                                            False)
-        self.use_crate_root = self.get_view_settings().get('use-crate-root',
-                                                           False)
+        v_settings = self.get_view_settings()
+        self.working_dir = self.get_working_dir(v_settings)
+        self.cargo = os.path.exists(os.path.join(self.working_dir, 'Cargo.toml'))
 
-        if self.use_cargo or self.use_cargo_check:
-            cargo_cmd = ['check'] if self.use_cargo_check else self.cmd
+        if self.cargo:
+            cargo_command = v_settings.get('cargo_command', self.cargo_command).split()
+            return ['cargo'] + cargo_command
 
-            current_dir = os.path.dirname(self.filename)
-            self.cargo_config = util.find_file(current_dir, 'Cargo.toml')
+        elif v_settings.get('rustc_fallback') or v_settings.get('rustc_live'):
+            if self.working_dir in tmpdirs:
+                cache_dir = tmpdirs[self.working_dir].name
+            else:
+                tmp_dir = tempfile.TemporaryDirectory(prefix=TMPDIR_PREFIX)
+                tmpdirs[self.working_dir] = tmp_dir
+                cache_dir = tmp_dir.name
+                logger.info("Created temporary cache dir at: %s", cache_dir)
 
-            if self.cargo_config:
-                self.tempfile_suffix = '-'
+            file = '$file_on_disk' if self.tempfile_suffix == '-' else '$temp_file'
 
-                old_cwd = os.getcwd()
-                os.chdir(os.path.dirname(self.cargo_config))
-                try:
-                    return util.communicate(
-                        ['cargo'] + cargo_cmd + ['--manifest-path',
-                                                 self.cargo_config],
-                        code=None,
-                        output_stream=self.error_stream,
-                        env=self.env)
-                finally:
-                    os.chdir(old_cwd)
+            return ['rustc', '${args}',
+                    '--error-format=json',
+                    '--out-dir', cache_dir,
+                    file]
+        else:
+            return None
 
-        if self.use_crate_root:
-            self.crate_root = self.locate_crate_root()
+    def finalize_cmd(self, *args, **kwargs):
+        """Never auto-append (cargo runs on the working dir)."""
+        if kwargs.get('auto_append'):
+            kwargs['auto_append'] = False
+        return super().finalize_cmd(*args, **kwargs)
 
-            if self.crate_root:
-                cmd.append(self.crate_root)
-                self.tempfile_suffix = '-'
+    def get_environment(self, settings):
+        """Ensure --error-format is in RUSTFLAGS."""
+        env = super().get_environment(settings)
+        env['RUSTFLAGS'] = env.get('RUSTFLAGS', '') + ' --error-format=json'
+        return env
 
-                return util.communicate(cmd,
-                                        code=None,
-                                        output_stream=self.error_stream,
-                                        env=self.env)
+    @staticmethod
+    def _parse_output_line(line):
+        """Filter out frequent/normal non-JSON lines."""
+        stripped = line.strip()
+        valid_words = ("Checking", "Finished", "Downloading", "Compiling")
+        if any(stripped.startswith(word) for word in valid_words):
+            return None
+        return json.loads(line)
 
-        self.tempfile_suffix = 'rs'
-        return self.tmpfile(cmd, code)
-
-    def split_match(self, match):
-        """
-        Return the components of the match.
+    def find_errors(self, output):
+        """Return the components of the match.
 
         We override this because Cargo lints all referenced files,
-        and we only want errors from the linted file. The same applies
-        when linting from the crate root. Of course when linting a single
-        file only, all the errors will be from that file because it is
-        in a temporary directory.
-
-        The matched file path is considered in the context of a working directory.
-        If it is an absolute path, the working directory will be ignored. This
-        working directory is not the same as the current Sublime Text process
-        working directory -- it is the working directory of an external command.
-
-        For Cargo, the working directory is the directory of Cargo.toml.
-        When working with a crate root, the working directory is the directory of the
-        crate root source file.
+        and we only want errors from the linted file.
+        Of course when linting a single file only,
+        all the errors will be from that file.
         """
-        # if match:
-        #     if os.path.basename(self.filename) != os.path.basename(match.group('file')):
-        #         match = None
+        for line in output.splitlines():
+            try:
+                data = self._parse_output_line(line)
+            except ValueError as e:
+                logger.warning("Invalid JSON from executable %s; %r", e, line)
+                self.notify_failure()
+                return None
 
-        matched_file = match.group('file') if match else None
+            if not data or not data['spans']:
+                continue
+            span = data['spans'][0]
 
-        if matched_file:
-            if self.use_cargo:
-                path = self.cargo_config
-            elif self.use_crate_root:
-                path = self.crate_root
+            if self.cargo:
+                matched_file = span['file_name']
+                matched_file = os.path.join(self.working_dir, matched_file)
+                if matched_file != self.filename:
+                    continue
+
+            if span['text'] and span['line_start'] == span['line_end']:
+                text = span['text'][0]
+                near = text['text'][text['highlight_start']:text['highlight_end']]
             else:
-                path = False
+                near = None
 
-            if path:
-                working_dir = os.path.dirname(path)
-                if not self.is_current_file(working_dir, matched_file):
-                    match = None
+            code = data.get('code')
+            code = code.get('code', True) if code else True
+            if data['level'].endswith("error"):
+                error = code
+                warning = False
+            else:
+                error = False
+                warning = code
 
-        return super().split_match(match)
+            yield LintMatch(
+                match=span,
+                line=span['line_start'] - 1,
+                col=span['column_start'] - 1,
+                error=error,
+                warning=warning,
+                message=data['message'],
+                near=near,
+            )
 
-    def is_current_file(self, working_dir, matched_file):
-        """
-        Return true if `matched_file` is logically the same file as `self.filename`.
+    def reposition_match(self, line, col, m, vv):
+        """Apply region positions as reported by rustc."""
+        match = m.match
+        if (
+            col is None
+            or 'line_end' not in match
+            or 'column_end' not in match
+        ):
+            return super().reposition_match(line, col, m, vv)
 
-        Cargo example demonstrating how matching is done:
+        # apply line_col_base manually
+        end_line = match['line_end'] - 1
+        end_column = match['column_end'] - 1
 
-          - os.getcwd() = '/Applications/Sublime Text.app/Contents/MacOS'
-          - `working_dir` = '/path/to/project'
-          - `matched_file` = 'src/foo.rs'
-          - `self.filename` = '/path/to/project/src/foo.rs'
+        # add line lenths of all lines inbetween
+        for _line in range(line, end_line):
+            text = vv.select_line(_line)
+            end_column += len(text)
 
-        The current OS directory is not considered at all -- comparison is only done
-        relative to where Cargo.toml was found.  `os.path.realpath` is used to
-        normalize the filenames so that they can be directly compared after manipulation.
-        """
-        abs_matched_file = os.path.join(working_dir, matched_file)
+        return line, col, end_column
 
-        persist.debug('Sublime Text cwd: ', os.getcwd())
-        persist.debug('Build cwd: ', working_dir)
-        persist.debug('Current filename: ', self.filename)
-        persist.debug('Matched filename: ', matched_file)
-        persist.debug('Compared filename: ', abs_matched_file)
 
-        return os.path.realpath(self.filename) == os.path.realpath(
-            abs_matched_file)
+def _cleanup_tmpdirs():
+    def _onerror(function, path, exc_info):
+        logger.exception("Unable to delete '%s' while cleaning up temporary directory",
+                         path, exc_info=exc_info)
+    tmpdir = tempfile.gettempdir()
+    for dirname in os.listdir(tmpdir):
+        if dirname.startswith(TMPDIR_PREFIX):
+            shutil.rmtree(os.path.join(tmpdir, dirname), onerror=_onerror)
 
-    def locate_crate_root(self):
-        """
-        Return the filename of the crate root.
 
-        The filename may be manually set in a configuration file (highest priority),
-        or it is located by convention.
+def plugin_loaded():
+    """Attempt to clean up temporary directories from previous runs."""
+    _cleanup_tmpdirs()
 
-        When no configuration is set, main.rs will take preference over lib.rs.
-        If neither main.rs or lib.rs are found, give up.
-        """
-        crate_root = self.get_view_settings().get('crate-root', None)
 
-        if not crate_root:
-            crate_root = util.find_file(
-                os.path.dirname(self.filename), 'main.rs')
+def plugin_unloaded():
+    """Clear references to TemporaryDirectory instances.
 
-        if not crate_root:
-            crate_root = util.find_file(
-                os.path.dirname(self.filename), 'lib.rs')
-
-        return crate_root
+    They should then be removed automatically.
+    """
+    tmpdirs.clear()
