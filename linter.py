@@ -50,14 +50,14 @@ class Rust(Linter):
     line_col_base = (1, 0)
     error_stream = util.STREAM_STDERR
 
-    def should_lint(self, reason=None):
-        """Only allow background mode when rustc_live is is enabled."""
-        # TOCHECK is this sensitive to races?
-        v_settings = self.get_view_settings()
-        rustc_live = v_settings.get('rustc_live')
-        self.tempfile_suffix = "rs" if rustc_live and not self.cargo else "-"
-
-        return super().should_lint(reason=reason)
+#    def should_lint(self, reason=None):
+#        """Only allow background mode when rustc_live is is enabled."""
+#        # TOCHECK is this sensitive to races?
+#        v_settings = self.get_view_settings()
+#        rustc_live = v_settings.get('rustc_live')
+#        self.tempfile_suffix = "rs" if rustc_live and not self.cargo else "-"
+#
+#        return super().should_lint(reason=reason)
 
     def cmd(self):
         """Build command used to lint.
@@ -100,11 +100,11 @@ class Rust(Linter):
             kwargs['auto_append'] = False
         return super().finalize_cmd(*args, **kwargs)
 
-    def get_environment(self, settings):
-        """Ensure --error-format is in RUSTFLAGS."""
-        env = super().get_environment(settings)
-        env['RUSTFLAGS'] = env.get('RUSTFLAGS', '') + ' --error-format=json'
-        return env
+#    def get_environment(self, settings):
+#        """Ensure --error-format is in RUSTFLAGS."""
+#        env = super().get_environment(settings)
+#        env['RUSTFLAGS'] = env.get('RUSTFLAGS', '') + ' --error-format=json'
+#        return env
 
     @staticmethod
     def _parse_output_line(line):
